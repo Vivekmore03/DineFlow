@@ -1,12 +1,3 @@
-// ============================================================================
-// QR Dine — Prisma Schema
-// Multi-tenant Restaurant QR Ordering SaaS MVP
-// ============================================================================
-// Architecture: Shared database, row-level tenant isolation via restaurantId.
-// Every business table includes restaurantId for scoped queries.
-// Owner:Restaurant = 1:1 (MVP). Multi-tenant infra retained for future.
-// ============================================================================
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -17,9 +8,269 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENUMS
-// ─────────────────────────────────────────────────────────────────────────────
+/// Authenticated users: restaurant owners and kitchen staff.
+/// Customers are anonymous (identified by DiningSession.customerToken).
+model User {
+  id              String      @id @default(cuid())
+  email           String      @unique
+  passwordHash    String      @map("password_hash")
+  name            String
+  role            UserRole
+  /// For KITCHEN_STAFF: FK to the restaurant they work at.
+  /// For OWNER: null (ownership is via Restaurant.ownerId).
+  restaurantId    String?     @map("restaurant_id")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+  ownedRestaurant Restaurant? @relation("owner")
+  restaurant      Restaurant? @relation("staff", fields: [restaurantId], references: [id])
+
+  @@index([restaurantId], map: "idx_user_restaurant")
+  @@map("users")
+}
+
+/// A restaurant tenant. All business data is scoped to a restaurant via restaurantId.
+model Restaurant {
+  id         String          @id @default(cuid())
+  name       String
+  /// URL-safe identifier, e.g. "tandoori-nights"
+  slug       String          @unique
+  /// Cloudinary URL
+  logo       String?
+  address    String?
+  gstNumber  String?         @map("gst_number")
+  /// Configurable GST % per restaurant
+  taxRate    Float           @default(5.0) @map("tax_rate")
+  currency   String          @default("INR")
+  /// 1:1 owner relationship. @unique enforces one restaurant per owner (MVP).
+  ownerId    String          @unique @map("owner_id")
+  createdAt  DateTime        @default(now()) @map("created_at")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+  categories Category[]
+  sessions   DiningSession[]
+  menuItems  MenuItem[]
+  owner      User            @relation("owner", fields: [ownerId], references: [id], onDelete: Cascade)
+  tables     Table[]
+  staff      User[]          @relation("staff")
+
+  @@map("restaurants")
+}
+
+/// A physical table in the restaurant. Each table gets a unique QR code.
+/// QR URL: ${NEXT_PUBLIC_APP_URL}/r/{restaurant.slug}/t/{table.id}
+model Table {
+  id           String          @id @default(cuid())
+  restaurantId String          @map("restaurant_id")
+  /// Display name: "Table 1", "Patio A", etc.
+  name         String
+  /// Numeric identifier: 1, 2, 3...
+  number       Int
+  /// QR SVG data URI (for display/download)
+  qrCode       String?         @map("qr_code")
+  isActive     Boolean         @default(true) @map("is_active")
+  status       TableStatus     @default(AVAILABLE)
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+  sessions     DiningSession[]
+  restaurant   Restaurant      @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  waiterCalls  WaiterCall[]
+
+  @@unique([restaurantId, number], name: "uq_restaurant_table_number")
+  @@index([restaurantId], map: "idx_table_restaurant")
+  @@map("tables")
+}
+
+/// Menu categories: Starters, Main Course, Beverages, Desserts, etc.
+model Category {
+  id           String     @id @default(cuid())
+  restaurantId String     @map("restaurant_id")
+  name         String
+  /// Controls display ordering
+  sortOrder    Int        @default(0) @map("sort_order")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  items        MenuItem[]
+
+  @@index([restaurantId, sortOrder], map: "idx_category_restaurant_sort")
+  @@map("categories")
+}
+
+/// Individual menu items within a category. Soft-deletable (isDeleted flag)
+/// because past OrderItems reference them.
+model MenuItem {
+  id           String      @id @default(cuid())
+  restaurantId String      @map("restaurant_id")
+  categoryId   String      @map("category_id")
+  name         String
+  description  String?
+  /// Price in restaurant's currency
+  price        Float
+  /// Cloudinary URL
+  image        String?
+  isAvailable  Boolean     @default(true) @map("is_available")
+  /// Soft delete for referential safety
+  isDeleted    Boolean     @default(false) @map("is_deleted")
+  sortOrder    Int         @default(0) @map("sort_order")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+  category     Category    @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  restaurant   Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  orderItems   OrderItem[]
+
+  @@index([restaurantId, categoryId, isAvailable], map: "idx_menuitem_restaurant_category")
+  @@index([restaurantId, isDeleted], map: "idx_menuitem_soft_delete")
+  @@map("menu_items")
+}
+
+/// A dining session represents a customer's visit at a specific table.
+/// Multiple orders can belong to one session. Session closes ONLY when
+/// bill is marked Paid. Only ONE active session per table at a time.
+model DiningSession {
+  id            String        @id @default(cuid())
+  restaurantId  String        @map("restaurant_id")
+  tableId       String        @map("table_id")
+  status        SessionStatus @default(ACTIVE)
+  /// Anonymous session token stored in customer's localStorage.
+  customerToken String        @unique @default(cuid()) @map("customer_token")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+  billRequests  BillRequest[]
+  bill          Bill?
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  table         Table         @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  orders        Order[]
+
+  @@index([tableId, status], map: "idx_session_table_status")
+  @@index([restaurantId, status], map: "idx_session_restaurant_status")
+  @@map("dining_sessions")
+}
+
+/// An individual order placed within a dining session.
+/// A customer can place multiple orders per session.
+model Order {
+  id           String        @id @default(cuid())
+  restaurantId String        @map("restaurant_id")
+  sessionId    String        @map("session_id")
+  /// Human-readable order number. Auto-incremented daily per restaurant.
+  /// Format: sequential integer, resets each day (e.g., 1, 2, 3...).
+  orderNumber  Int           @map("order_number")
+  status       OrderStatus   @default(PENDING)
+  /// Sum of all item prices × quantities
+  totalAmount  Float         @map("total_amount")
+  specialNotes String?       @map("special_notes")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  items        OrderItem[]
+  session      DiningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, status, createdAt], map: "idx_order_restaurant_status_time")
+  @@index([sessionId], map: "idx_order_session")
+  @@index([restaurantId, createdAt], map: "idx_order_restaurant_date")
+  @@map("orders")
+}
+
+/// A line item in an order. Stores snapshot of name + price at order time
+/// to prevent retroactive price changes from affecting historical orders.
+model OrderItem {
+  id         String   @id @default(cuid())
+  orderId    String   @map("order_id")
+  /// Reference to the original menu item (for analytics, not display).
+  menuItemId String   @map("menu_item_id")
+  /// ── Snapshots at order time ──
+  /// Menu item name at time of order
+  name       String
+  /// Unit price at time of order
+  price      Float
+  quantity   Int
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId], map: "idx_orderitem_order")
+  @@index([menuItemId], map: "idx_orderitem_menuitem")
+  @@map("order_items")
+}
+
+/// Aggregated bill for a dining session. Generated when staff processes
+/// a bill request. One bill per session (1:1). Contains tax snapshot.
+model Bill {
+  id            String        @id @default(cuid())
+  restaurantId  String        @map("restaurant_id")
+  sessionId     String        @unique @map("session_id")
+  /// Human-readable: "BILL-0001"
+  billNumber    String        @map("bill_number")
+  /// Sum of all items before tax
+  subtotal      Float
+  /// Snapshot of restaurant.taxRate at generation time
+  taxRate       Float         @map("tax_rate")
+  /// Calculated: subtotal × (taxRate / 100)
+  taxAmount     Float         @map("tax_amount")
+  /// subtotal + taxAmount
+  grandTotal    Float         @map("grand_total")
+  paymentStatus PaymentStatus @default(PENDING) @map("payment_status")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+  items         BillItem[]
+  session       DiningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, paymentStatus], map: "idx_bill_restaurant_payment")
+  @@index([restaurantId, billNumber], map: "idx_bill_restaurant_number")
+  @@map("bills")
+}
+
+/// Aggregated line item in a bill. Items with the same name+price across
+/// multiple orders in a session are merged (quantities summed).
+model BillItem {
+  id         String   @id @default(cuid())
+  billId     String   @map("bill_id")
+  /// Item name
+  name       String
+  /// Total quantity across all orders in the session
+  quantity   Int
+  /// Unit price
+  unitPrice  Float    @map("unit_price")
+  /// unitPrice × quantity
+  totalPrice Float    @map("total_price")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  bill       Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId], map: "idx_billitem_bill")
+  @@map("bill_items")
+}
+
+/// Real-time waiter call request from a customer at a table.
+/// Admin dashboard shows pending calls with table identification.
+model WaiterCall {
+  id           String           @id @default(cuid())
+  restaurantId String           @map("restaurant_id")
+  tableId      String           @map("table_id")
+  status       WaiterCallStatus @default(PENDING)
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+  table        Table            @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, status], map: "idx_waitercall_restaurant_status")
+  @@index([tableId, createdAt], map: "idx_waitercall_table_time")
+  @@map("waiter_calls")
+}
+
+/// Customer request to generate a bill for their dining session.
+/// Admin receives real-time notification and generates the bill.
+model BillRequest {
+  id           String            @id @default(cuid())
+  restaurantId String            @map("restaurant_id")
+  sessionId    String            @map("session_id")
+  status       BillRequestStatus @default(PENDING)
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  session      DiningSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId, status], map: "idx_billrequest_restaurant_status")
+  @@index([sessionId], map: "idx_billrequest_session")
+  @@map("bill_requests")
+}
 
 /// User roles in the system. Owners manage restaurants; kitchen staff handle orders.
 enum UserRole {
@@ -70,365 +321,4 @@ enum BillRequestStatus {
   PENDING
   BILL_GENERATED
   COMPLETED
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// USER
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Authenticated users: restaurant owners and kitchen staff.
-/// Customers are anonymous (identified by DiningSession.customerToken).
-model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  name         String
-  role         UserRole
-
-  /// For KITCHEN_STAFF: FK to the restaurant they work at.
-  /// For OWNER: null (ownership is via Restaurant.ownerId).
-  restaurantId String?  @map("restaurant_id")
-  restaurant   Restaurant? @relation("staff", fields: [restaurantId], references: [id], onDelete: SetNull)
-
-  /// 1:1 — one owner can own exactly one restaurant (MVP).
-  ownedRestaurant Restaurant? @relation("owner")
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  @@index([restaurantId], name: "idx_user_restaurant")
-  @@map("users")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RESTAURANT
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A restaurant tenant. All business data is scoped to a restaurant via restaurantId.
-model Restaurant {
-  id        String  @id @default(cuid())
-  name      String
-  slug      String  @unique /// URL-safe identifier, e.g. "tandoori-nights"
-  logo      String? /// Cloudinary URL
-  address   String?
-  gstNumber String? @map("gst_number")
-  taxRate   Float   @default(5.0) @map("tax_rate") /// Configurable GST % per restaurant
-  currency  String  @default("INR")
-
-  /// 1:1 owner relationship. @unique enforces one restaurant per owner (MVP).
-  ownerId String @unique @map("owner_id")
-  owner   User   @relation("owner", fields: [ownerId], references: [id], onDelete: Cascade)
-
-  /// Kitchen staff assigned to this restaurant.
-  staff User[] @relation("staff")
-
-  // ── Business data ──
-  tables     Table[]
-  categories Category[]
-  menuItems  MenuItem[]
-  sessions   DiningSession[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  @@map("restaurants")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TABLE
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A physical table in the restaurant. Each table gets a unique QR code.
-/// QR URL: ${NEXT_PUBLIC_APP_URL}/r/{restaurant.slug}/t/{table.id}
-model Table {
-  id           String     @id @default(cuid())
-  restaurantId String     @map("restaurant_id")
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-
-  name     String  /// Display name: "Table 1", "Patio A", etc.
-  number   Int     /// Numeric identifier: 1, 2, 3...
-  qrCode   String? @map("qr_code") /// QR SVG data URI (for display/download)
-  isActive Boolean @default(true) @map("is_active")
-  status   TableStatus @default(AVAILABLE)
-
-  sessions    DiningSession[]
-  waiterCalls WaiterCall[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Prevent duplicate table numbers within the same restaurant.
-  @@unique([restaurantId, number], name: "uq_restaurant_table_number")
-
-  /// Fast lookup: which tables belong to a restaurant.
-  @@index([restaurantId], name: "idx_table_restaurant")
-
-  @@map("tables")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CATEGORY
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Menu categories: Starters, Main Course, Beverages, Desserts, etc.
-model Category {
-  id           String     @id @default(cuid())
-  restaurantId String     @map("restaurant_id")
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-
-  name      String
-  sortOrder Int @default(0) @map("sort_order") /// Controls display ordering
-
-  items MenuItem[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Fast lookup + ordering.
-  @@index([restaurantId, sortOrder], name: "idx_category_restaurant_sort")
-
-  @@map("categories")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MENU ITEM
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Individual menu items within a category. Soft-deletable (isDeleted flag)
-/// because past OrderItems reference them.
-model MenuItem {
-  id           String     @id @default(cuid())
-  restaurantId String     @map("restaurant_id")
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-  categoryId   String     @map("category_id")
-  category     Category   @relation(fields: [categoryId], references: [id], onDelete: Cascade)
-
-  name        String
-  description String?
-  price       Float    /// Price in restaurant's currency
-  image       String?  /// Cloudinary URL
-  isAvailable Boolean  @default(true) @map("is_available")
-  isDeleted   Boolean  @default(false) @map("is_deleted") /// Soft delete for referential safety
-  sortOrder   Int      @default(0) @map("sort_order")
-
-  orderItems OrderItem[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Fast menu queries: available items by category.
-  @@index([restaurantId, categoryId, isAvailable], name: "idx_menuitem_restaurant_category")
-
-  /// Exclude soft-deleted items from normal queries.
-  @@index([restaurantId, isDeleted], name: "idx_menuitem_soft_delete")
-
-  @@map("menu_items")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DINING SESSION
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A dining session represents a customer's visit at a specific table.
-/// Multiple orders can belong to one session. Session closes ONLY when
-/// bill is marked Paid. Only ONE active session per table at a time.
-model DiningSession {
-  id           String     @id @default(cuid())
-  restaurantId String     @map("restaurant_id")
-  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-  tableId      String     @map("table_id")
-  table        Table      @relation(fields: [tableId], references: [id], onDelete: Cascade)
-
-  status        SessionStatus @default(ACTIVE)
-  /// Anonymous session token stored in customer's localStorage.
-  customerToken String        @unique @default(cuid()) @map("customer_token")
-
-  orders       Order[]
-  bill         Bill?
-  billRequests BillRequest[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Find active session for a table (enforce single active session in app logic).
-  @@index([tableId, status], name: "idx_session_table_status")
-
-  /// Dashboard: list active/bill-requested sessions for a restaurant.
-  @@index([restaurantId, status], name: "idx_session_restaurant_status")
-
-  @@map("dining_sessions")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ORDER
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// An individual order placed within a dining session.
-/// A customer can place multiple orders per session.
-model Order {
-  id           String        @id @default(cuid())
-  restaurantId String        @map("restaurant_id")
-  sessionId    String        @map("session_id")
-  session      DiningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-
-  /// Human-readable order number. Auto-incremented daily per restaurant.
-  /// Format: sequential integer, resets each day (e.g., 1, 2, 3...).
-  orderNumber Int          @map("order_number")
-  status      OrderStatus  @default(PENDING)
-  totalAmount Float        @map("total_amount") /// Sum of all item prices × quantities
-  specialNotes String?     @map("special_notes")
-
-  items OrderItem[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Kitchen dashboard: active orders for a restaurant, sorted by creation.
-  @@index([restaurantId, status, createdAt], name: "idx_order_restaurant_status_time")
-
-  /// Session order history.
-  @@index([sessionId], name: "idx_order_session")
-
-  /// Daily order numbering lookup.
-  @@index([restaurantId, createdAt], name: "idx_order_restaurant_date")
-
-  @@map("orders")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ORDER ITEM
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A line item in an order. Stores snapshot of name + price at order time
-/// to prevent retroactive price changes from affecting historical orders.
-model OrderItem {
-  id       String @id @default(cuid())
-  orderId  String @map("order_id")
-  order    Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
-
-  /// Reference to the original menu item (for analytics, not display).
-  menuItemId String   @map("menu_item_id")
-  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
-
-  /// ── Snapshots at order time ──
-  name     String /// Menu item name at time of order
-  price    Float  /// Unit price at time of order
-  quantity Int
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  @@index([orderId], name: "idx_orderitem_order")
-  @@index([menuItemId], name: "idx_orderitem_menuitem")
-
-  @@map("order_items")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BILL
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Aggregated bill for a dining session. Generated when staff processes
-/// a bill request. One bill per session (1:1). Contains tax snapshot.
-model Bill {
-  id           String        @id @default(cuid())
-  restaurantId String        @map("restaurant_id")
-  sessionId    String        @unique @map("session_id")
-  session      DiningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-
-  billNumber    String        @map("bill_number") /// Human-readable: "BILL-0001"
-  subtotal      Float         /// Sum of all items before tax
-  taxRate       Float         @map("tax_rate") /// Snapshot of restaurant.taxRate at generation time
-  taxAmount     Float         @map("tax_amount") /// Calculated: subtotal × (taxRate / 100)
-  grandTotal    Float         @map("grand_total") /// subtotal + taxAmount
-  paymentStatus PaymentStatus @default(PENDING) @map("payment_status")
-
-  items BillItem[]
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Admin billing dashboard: filter by payment status.
-  @@index([restaurantId, paymentStatus], name: "idx_bill_restaurant_payment")
-
-  /// Bill number lookup.
-  @@index([restaurantId, billNumber], name: "idx_bill_restaurant_number")
-
-  @@map("bills")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BILL ITEM
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Aggregated line item in a bill. Items with the same name+price across
-/// multiple orders in a session are merged (quantities summed).
-model BillItem {
-  id     String @id @default(cuid())
-  billId String @map("bill_id")
-  bill   Bill   @relation(fields: [billId], references: [id], onDelete: Cascade)
-
-  name       String /// Item name
-  quantity   Int    /// Total quantity across all orders in the session
-  unitPrice  Float  @map("unit_price") /// Unit price
-  totalPrice Float  @map("total_price") /// unitPrice × quantity
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  @@index([billId], name: "idx_billitem_bill")
-
-  @@map("bill_items")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WAITER CALL
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Real-time waiter call request from a customer at a table.
-/// Admin dashboard shows pending calls with table identification.
-model WaiterCall {
-  id           String           @id @default(cuid())
-  restaurantId String           @map("restaurant_id")
-  tableId      String           @map("table_id")
-  table        Table            @relation(fields: [tableId], references: [id], onDelete: Cascade)
-
-  status WaiterCallStatus @default(PENDING)
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Admin dashboard: pending waiter calls for a restaurant.
-  @@index([restaurantId, status], name: "idx_waitercall_restaurant_status")
-
-  /// Prevent spam: check recent calls for a table.
-  @@index([tableId, createdAt], name: "idx_waitercall_table_time")
-
-  @@map("waiter_calls")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BILL REQUEST
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Customer request to generate a bill for their dining session.
-/// Admin receives real-time notification and generates the bill.
-model BillRequest {
-  id           String            @id @default(cuid())
-  restaurantId String            @map("restaurant_id")
-  sessionId    String            @map("session_id")
-  session      DiningSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-
-  status BillRequestStatus @default(PENDING)
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  /// Admin dashboard: pending bill requests for a restaurant.
-  @@index([restaurantId, status], name: "idx_billrequest_restaurant_status")
-
-  /// Session lookup.
-  @@index([sessionId], name: "idx_billrequest_session")
-
-  @@map("bill_requests")
 }

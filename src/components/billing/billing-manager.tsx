@@ -65,7 +65,7 @@ export function BillingManager({ restaurantId, currency }: BillingManagerProps) 
   const fetchBills = useCallback(async (showIndicator = false) => {
     if (showIndicator) setRefreshing(true);
     try {
-      const res = await fetch(`/api/restaurants/${restaurantId}/bills`);
+      const res = await fetch(`/api/restaurants/${restaurantId}/bills`, { cache: "no-store" });
       if (!res.ok) throw new Error();
       const data = await res.json();
       setBills(data.bills || []);

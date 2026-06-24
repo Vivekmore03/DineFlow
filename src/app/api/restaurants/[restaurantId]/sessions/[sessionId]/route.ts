@@ -27,6 +27,9 @@ export async function GET(request: NextRequest, { params }: Ctx) {
         table: {
           select: { id: true, name: true, number: true, status: true },
         },
+        restaurant: {
+          select: { taxRate: true },
+        },
         orders: {
           include: {
             items: true,

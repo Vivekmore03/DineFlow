@@ -88,7 +88,7 @@ export function SessionsManager({ restaurantId, currency }: SessionsManagerProps
   const fetchSessions = useCallback(async (showIndicator = false) => {
     if (showIndicator) setRefreshing(true);
     try {
-      const res = await fetch(`/api/restaurants/${restaurantId}/sessions`);
+      const res = await fetch(`/api/restaurants/${restaurantId}/sessions`, { cache: "no-store" });
       if (!res.ok) throw new Error();
       const data = await res.json();
       setSessions(data.sessions || []);
@@ -270,11 +270,57 @@ export function SessionsManager({ restaurantId, currency }: SessionsManagerProps
       if (!res.ok) throw new Error();
       const data = await res.json();
       const session = data.session;
-      if (!session.bill) {
-        toast.error("Bill has not been generated yet");
+      
+      if (session.bill) {
+        printBill(session.bill, tableName);
         return;
       }
-      printBill(session.bill, tableName);
+      
+      // Generate Provisional Bill
+      const activeOrders = session.orders.filter((o: any) => o.status !== "CANCELLED");
+      if (activeOrders.length === 0) {
+        toast.error("No active orders to print.");
+        return;
+      }
+
+      const aggregated: Record<string, any> = {};
+      let subtotal = 0;
+      
+      activeOrders.forEach((o: any) => {
+        o.items.forEach((it: any) => {
+          const key = `${it.name}_${it.price}`;
+          if (aggregated[key]) {
+            aggregated[key].quantity += it.quantity;
+            aggregated[key].totalPrice += (it.quantity * it.price);
+          } else {
+            aggregated[key] = {
+              name: it.name,
+              quantity: it.quantity,
+              unitPrice: it.price,
+              totalPrice: (it.quantity * it.price)
+            };
+          }
+          subtotal += (it.quantity * it.price);
+        });
+      });
+
+      const items = Object.values(aggregated);
+      const taxRate = session.restaurant?.taxRate || 0;
+      const taxAmount = subtotal * (taxRate / 100);
+      const grandTotal = subtotal + taxAmount;
+
+      const provisionalBill = {
+        billNumber: "PROVISIONAL",
+        createdAt: new Date().toISOString(),
+        paymentStatus: "UNPAID",
+        subtotal,
+        taxRate,
+        taxAmount,
+        grandTotal,
+        items
+      };
+
+      printBill(provisionalBill, tableName);
     } catch {
       toast.error("An error occurred while loading bill details for printing");
     } finally {
@@ -462,18 +508,16 @@ export function SessionsManager({ restaurantId, currency }: SessionsManagerProps
                         Details
                       </Button>
 
-                      {session.bill && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => handlePrintSessionBill(session.id, session.table.name)}
-                          isLoading={printingLoading[session.id]}
-                          className="px-2.5 h-8.5 cursor-pointer text-muted-foreground hover:text-foreground"
-                          title="Print Receipt"
-                        >
-                          <Printer className="h-4 w-4" />
-                        </Button>
-                      )}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handlePrintSessionBill(session.id, session.table.name)}
+                        isLoading={printingLoading[session.id]}
+                        className="flex-1 text-xs gap-1 h-8.5 cursor-pointer text-muted-foreground hover:text-foreground"
+                      >
+                        <Printer className="h-3.5 w-3.5" />
+                        Print
+                      </Button>
 
                       {!session.bill ? (
                         <Button
@@ -632,17 +676,15 @@ export function SessionsManager({ restaurantId, currency }: SessionsManagerProps
               Close Panel
             </Button>
 
-            {sessionDetail?.bill && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => printBill(sessionDetail.bill, sessionDetail.table.name)}
-                className="flex-1 cursor-pointer text-xs gap-1.5"
-              >
-                <Printer className="h-4 w-4" />
-                Print Bill
-              </Button>
-            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePrintSessionBill(sessionDetail!.id, sessionDetail!.table.name)}
+              className="flex-1 cursor-pointer text-xs gap-1.5"
+            >
+              <Printer className="h-4 w-4" />
+              Print Bill
+            </Button>
 
             {!sessionDetail?.bill ? (
               <Button

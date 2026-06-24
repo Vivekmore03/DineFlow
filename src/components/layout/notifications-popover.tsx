@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { Bell, ConciergeBell, Receipt, X, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -40,6 +40,7 @@ const playChimeAlert = () => {
 
 export function NotificationsPopover() {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const seenIdsRef = useRef<Set<string>>(new Set());
   const { restaurant } = useAuthStore();
   const restaurantId = restaurant?.id;
   
@@ -52,26 +53,25 @@ export function NotificationsPopover() {
   );
 
   const addAlert = (type: "waiter" | "bill", table: string, id: string) => {
-    setAlerts((prev) => {
-      if (prev.some((a) => a.id === id)) return prev;
+    if (seenIdsRef.current.has(id)) return;
+    seenIdsRef.current.add(id);
 
-      const newAlert: AlertItem = {
-        id,
-        type,
-        table,
-        time: "Just now",
-        status: "pending",
-      };
+    const newAlert: AlertItem = {
+      id,
+      type,
+      table,
+      time: "Just now",
+      status: "pending",
+    };
 
-      toast.info(`[Real-time] New ${type === "waiter" ? "waiter call" : "bill request"} from ${table}!`);
-      
-      const audioEnabled = useKitchenStore.getState().audioEnabled;
-      if (audioEnabled) {
-        playChimeAlert();
-      }
+    toast.info(`[Real-time] New ${type === "waiter" ? "waiter call" : "bill request"} from ${table}!`);
+    
+    const audioEnabled = useKitchenStore.getState().audioEnabled;
+    if (audioEnabled) {
+      playChimeAlert();
+    }
 
-      return [newAlert, ...prev];
-    });
+    setAlerts((prev) => [newAlert, ...prev]);
   };
 
   // 1. Socket.IO Alerts Listener
