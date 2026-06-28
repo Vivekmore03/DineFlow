@@ -16,4 +16,7 @@ export const EVENTS = {
   ORDER_UPDATED: "order_updated",
   WAITER_CALL: "waiter_call",
   BILL_REQUEST: "bill_request",
+  BILL_GENERATED: "bill_generated",
+  BILL_PAID: "bill_paid",
+  SESSION_UPDATED: "session_updated"
 };

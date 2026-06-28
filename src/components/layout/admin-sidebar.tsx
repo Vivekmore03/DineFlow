@@ -30,7 +30,6 @@ const mainNavItems: SidebarItem[] = [
   { name: "Table & QRs", href: "/dashboard/tables", icon: QrCode },
   { name: "Active Sessions", href: "/dashboard/sessions", icon: ConciergeBell },
   { name: "Billing Tracker", href: "/dashboard/billing", icon: Receipt },
-  { name: "Staff Management", href: "/dashboard/staff", icon: Users },
 ];
 
 const secondaryNavItems: SidebarItem[] = [

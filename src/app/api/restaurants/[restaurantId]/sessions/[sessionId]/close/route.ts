@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAuthUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { emitSocketEvent } from "@/lib/socket-emitter";
+import { EVENTS } from "@/lib/events";
 
 type Ctx = { params: Promise<{ restaurantId: string; sessionId: string }> };
 
@@ -68,6 +70,18 @@ export async function POST(request: NextRequest, { params }: Ctx) {
         where: { sessionId },
         data: { status: "COMPLETED" },
       });
+    });
+
+    await emitSocketEvent(`restaurant:${restaurantId}`, EVENTS.BILL_PAID, {
+      billId: session.bill.id,
+      sessionId,
+      tableId: session.tableId,
+    });
+
+    await emitSocketEvent(`restaurant:${restaurantId}`, EVENTS.SESSION_UPDATED, {
+      sessionId,
+      tableId: session.tableId,
+      status: "COMPLETED",
     });
 
     return NextResponse.json({

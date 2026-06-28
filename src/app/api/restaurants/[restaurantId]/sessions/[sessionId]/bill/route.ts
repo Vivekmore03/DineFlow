@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAuthUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { emitSocketEvent } from "@/lib/socket-emitter";
+import { EVENTS } from "@/lib/events";
 
 type Ctx = { params: Promise<{ restaurantId: string; sessionId: string }> };
 
@@ -133,6 +135,13 @@ export async function POST(request: NextRequest, { params }: Ctx) {
       });
 
       return createdBill;
+    });
+
+    // Emit event to refresh dashboard
+    await emitSocketEvent(`restaurant:${restaurantId}`, EVENTS.BILL_GENERATED, {
+      billId: finalBill.id,
+      sessionId,
+      tableId: session.tableId,
     });
 
     return NextResponse.json({
